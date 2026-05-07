@@ -1,7 +1,50 @@
 <!DOCTYPE html>
 <!--
-  acte.legal — Admin Dashboard v32
+  acte.legal — Admin Dashboard v33
   Visual system: identical to notariat_dashboard_v48.html
+  v33: TWO column-name drift fixes (master chat patch request 2026-05-07,
+       B-A2 + B-A4). Both surfaced from v22's ŞABLOANE retest of v32 —
+       browser console showed two HTTP 400s on Supabase queries against
+       columns that didn't exist on the live schema.
+       
+       B-A2 — act_subtypes SELECT used 'label', real column is
+       'subtype_label_ro' (verified via phase_1_2_migration.sql + master's
+       information_schema check). Latent since v31; masked by v31's
+       hardcoded SUBTYPES constant. v32 retired SUBTYPES, so this turned
+       into a hard failure (empty cache → "—" in ŞABLOANE rows).
+       Fix: PostgREST alias on SELECT (label:subtype_label_ro). All
+       downstream s.label / sub.label reads stay untouched. Also added
+       display_order to the SELECT and switched cache sort to
+       display_order ASC (master's curated seed-migration order) with
+       ro-locale alphabetical as tiebreaker / fallback.
+       
+       B-A4 — office_subscriptions SELECT named columns that don't exist
+       on this table:
+         • subscription_status → real column is 'status'
+         • billing_cycle / trial_ends_at don't exist here at all; live on
+           notary_offices only (mirror table per Section 11.2 dual-table
+           model)
+       Fix at refreshOfficeSubscription():
+         • PostgREST alias on SELECT (subscription_status:status) so
+           downstream sub.subscription_status reads stay untouched
+         • DROP billing_cycle and trial_ends_at from office_subscriptions
+           SELECT — they're not there
+         • ADD billing_cycle to notary_offices SELECT (already had
+           trial_ends_at) so the merge has a fallback source
+         • Merge logic: billing_cycle and trial_ends_at now pulled from
+           nof on every refresh (not just the !sub fallback branch),
+           since they only exist on the mirror; current_period_end keeps
+           sub-canonical-with-nof-fallback pattern
+       
+       B-A5 (provisional dashboard render bug) — master will re-evaluate
+       after v33 ships; not patched pre-emptively per their guidance.
+       B-A3 (Edge Function CORS for admin-get-office-discount) — master
+       owns, not in v33.
+       
+       No changes to: commitUpload(), CUI validator, tab-focus refresh,
+       create-office flow, tier change flow, resend setup link, discount
+       fetcher (other than what B-A3 will fix from master's side), or
+       anything from v32's SUBTYPES drift fix (still in place).
   v32: SUBTYPES dropdown drift fix (master chat patch request 2026-05-07).
        The hardcoded SUBTYPES constant (v31 lines 1738-1744) had zero label
        overlap with live act_subtypes table on legalizari, partial drift on
@@ -1950,7 +1993,7 @@ function loadAll(){
   Promise.all([
     sb.from('notary_offices').select('id,name,city,address,contact_name,contact_email,contact_phone,lifecycle_status,plan,subscription_status,created_at'),
     sb.from('office_templates').select('*').eq('status','active'),
-    sb.from('act_subtypes').select('id,act_type,subtype_key,label').eq('active',true)
+    sb.from('act_subtypes').select('id,act_type,subtype_key,label:subtype_label_ro,display_order').eq('active',true)
   ]).then(function(results){
     var offRes=results[0], tplRes=results[1], subRes=results[2];
     if(offRes.error||!offRes.data||offRes.data.length===0){
@@ -1983,13 +2026,15 @@ function loadAll(){
       // Cases: loaded per-office on demand (see loadCasesForOffice).
       // For KPI + today list we do a lightweight fetch of all cases once:
       CASES=SEED_CASES; // placeholder until cases table confirmed in schema
-      // v31: act_subtypes cache. Indexed two ways:
-      //   ACT_SUBTYPES_BY_ID[id] = {id, act_type, subtype_key, label}
-      //   ACT_SUBTYPES_BY_LABEL[act_type+'|'+normalizeLabel(label)] = same row
-      // The label normalization (lowercase + diacritic strip) lets us match the
-      // dashboard's hardcoded SUBTYPES display labels against act_subtypes.label
-      // even with minor whitespace/case drift. If a label miss happens, commitUpload()
-      // surfaces a clear error toast — preferable to inserting a wrong subtype_id.
+      // v31/v33: act_subtypes cache. Indexed three ways:
+      //   ACT_SUBTYPES_BY_ID[id]                           = {id, act_type, subtype_key, label, display_order}
+      //   ACT_SUBTYPES_BY_LABEL[act_type+'|'+normLabel(L)] = same row
+      //   ACT_SUBTYPES_BY_TYPE[act_type]                   = [{...}, ...] sorted by display_order
+      // SELECT aliases subtype_label_ro→label (v33 B-A2 fix; live column is
+      // subtype_label_ro, not label). Label normalization (lowercase + diacritic
+      // strip) lets us match the upload-modal display label against the cache.
+      // If a label miss happens, commitUpload() surfaces a clear error toast —
+      // preferable to inserting a wrong subtype_id.
       ACT_SUBTYPES_BY_ID={};
       ACT_SUBTYPES_BY_LABEL={};
       ACT_SUBTYPES_BY_TYPE={};
@@ -1998,11 +2043,17 @@ function loadAll(){
           ACT_SUBTYPES_BY_ID[s.id]=s;
           ACT_SUBTYPES_BY_LABEL[s.act_type+'|'+normalizeLabel(s.label)]=s;
           if(!ACT_SUBTYPES_BY_TYPE[s.act_type]) ACT_SUBTYPES_BY_TYPE[s.act_type]=[];
-          ACT_SUBTYPES_BY_TYPE[s.act_type].push({id:s.id,subtype_key:s.subtype_key,label:s.label});
+          ACT_SUBTYPES_BY_TYPE[s.act_type].push({id:s.id,subtype_key:s.subtype_key,label:s.label,display_order:s.display_order});
         });
-        // v32: sort each act_type's options alphabetically (ro-locale)
+        // v32.1: sort by display_order (master's curated order) with ro-locale
+        // alphabetical fallback when display_order is absent or tied.
         Object.keys(ACT_SUBTYPES_BY_TYPE).forEach(function(at){
-          ACT_SUBTYPES_BY_TYPE[at].sort(function(a,b){return a.label.localeCompare(b.label,'ro');});
+          ACT_SUBTYPES_BY_TYPE[at].sort(function(a,b){
+            var ao=(a.display_order==null?9999:a.display_order);
+            var bo=(b.display_order==null?9999:b.display_order);
+            if(ao!==bo) return ao-bo;
+            return a.label.localeCompare(b.label,'ro');
+          });
         });
       }
       // v31: office_templates schema dropped name/subtype(text)/placeholders/notes.
@@ -4935,10 +4986,17 @@ function refreshOfficeSubscription(officeId,cb){
   // Read live office_subscriptions row + notary_offices columns that may have
   // changed (lifecycle_status), merge into OM[officeId], call cb. Used after
   // tier change success and on opening the office detail panel.
+  //
+  // v33: B-A4 fix. office_subscriptions has 'status' (not 'subscription_status')
+  // and does NOT have billing_cycle / trial_ends_at — those live on
+  // notary_offices only (mirror table per Section 11.2 dual-table model).
+  // Strategy: alias status→subscription_status in the SELECT so downstream
+  // consumer code stays untouched; pull billing_cycle + trial_ends_at from
+  // notary_offices on every refresh (not just sub-missing fallback).
   if(!SUPA_KEY||!officeId){if(cb)cb();return;}
   Promise.all([
-    sb.from('office_subscriptions').select('tier,tier_pending,tier_pending_effective_at,subscription_status,billing_cycle,current_period_end,trial_ends_at,stripe_customer_id,stripe_subscription_id').eq('office_id',officeId).maybeSingle(),
-    sb.from('notary_offices').select('plan,subscription_status,lifecycle_status,current_period_end,trial_ends_at').eq('id',officeId).maybeSingle()
+    sb.from('office_subscriptions').select('tier,tier_pending,tier_pending_effective_at,subscription_status:status,current_period_end,stripe_customer_id,stripe_subscription_id').eq('office_id',officeId).maybeSingle(),
+    sb.from('notary_offices').select('plan,subscription_status,billing_cycle,lifecycle_status,current_period_end,trial_ends_at').eq('id',officeId).maybeSingle()
   ]).then(function(results){
     var subRes=results[0],ofRes=results[1];
     var o=OM[officeId]; if(!o){if(cb)cb();return;}
@@ -4949,15 +5007,18 @@ function refreshOfficeSubscription(officeId,cb){
       o.tier_pending=sub.tier_pending||null;
       o.tier_pending_effective_at=sub.tier_pending_effective_at||null;
       o.subscription_status=sub.subscription_status||o.subscription_status;
-      o.billing_cycle=sub.billing_cycle||o.billing_cycle;
       o.current_period_end=sub.current_period_end||o.current_period_end;
-      o.trial_ends_at=sub.trial_ends_at||o.trial_ends_at;
       o.stripe_customer_id=sub.stripe_customer_id||o.stripe_customer_id;
       o.stripe_subscription_id=sub.stripe_subscription_id||o.stripe_subscription_id;
     }
     if(nof){
-      // notary_offices.plan is mirrored from office_subscriptions; trust sub if both exist
+      // v33: billing_cycle + trial_ends_at only exist on notary_offices, so always
+      // pull from there. plan + subscription_status come from sub when present
+      // (canonical); fall back to nof mirror only if no office_subscriptions row.
       if(!sub){o.plan=nof.plan||o.plan;o.subscription_status=nof.subscription_status||o.subscription_status;}
+      o.billing_cycle=nof.billing_cycle||o.billing_cycle;
+      o.trial_ends_at=nof.trial_ends_at||o.trial_ends_at;
+      if(!sub){o.current_period_end=nof.current_period_end||o.current_period_end;}
       o.lifecycle_status=nof.lifecycle_status||o.lifecycle_status;
     }
     if(cb)cb();
