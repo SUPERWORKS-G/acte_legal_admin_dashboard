@@ -1,7 +1,76 @@
 <!DOCTYPE html>
 <!--
-  acte.legal — Admin Dashboard v33
+  acte.legal — Admin Dashboard v35
   Visual system: identical to notariat_dashboard_v48.html
+  v35: THREE bug fixes (master chat v24 patch request 2026-05-07,
+       B-A5 + B-A6 + B-A7). v35 is also a CONSOLIDATED ship that folds
+       in v34 changes (mailto→fetch swap) — v34.html was shipped to
+       /outputs/ but never library-overwritten, so v35 catches up both
+       at once per master v25 directive.
+
+       B-A5/B-A7 (BLOCKER, dissolved into single fix) — Finalizează
+       upload-from-raw flow was broken end-to-end. Master's v24 gate-4
+       repro: drop .docx into INTRĂRI BRUTE → click Finalizează ⟶ on
+       row → modal opens but "Validează ⟶" button does nothing on click.
+       Diagnosis (admin chat v35, confirmed by master v25): the
+       Finalizează modal IS the same #upload-modal reused for both flows
+       (only the title text differs — see openTokenizeFromRaw line 2993).
+       The #upload-submit button at line 1693 IS the correct one. It
+       wasn't missing or selector-collided. It was DISABLED — line 3370
+       gate `!(at && sub && selectedFile)` keeps it disabled until all
+       three are set. selectedFile was null because addRawIntakeFiles()
+       (line 3036 in v33) pushed only metadata to RAW_INTAKE — filename,
+       size, content-type — but threw away the actual File object. So
+       openTokenizeFromRaw had nothing to bind. User had to re-drop the
+       same file into the dialog dropzone (B-A5 "double-upload"
+       symptom), which the dropzone change handler (line 3318) sets
+       selectedFile from. The double-upload was always the actual
+       workaround; people who didn't realize that saw a dead button.
+       Fix:
+         • addRawIntakeFiles: store File on row as fileObj (not
+           persisted to DB; client-only field, RAW_INTAKE is currently
+           UI-mock anyway per v28+).
+         • openTokenizeFromRaw: after resetUploadForm/showReplaceNote,
+           bind selectedFile = r.fileObj, populate the dropzone visual
+           state (file-drop-name innerText), and re-evaluate the disable
+           gate so the button enables at modal open.
+         • If a raw intake row somehow has no fileObj (e.g. created
+           before this fix in the same session, edge case), fall back
+           to the prior behavior — empty dropzone, user can re-drop.
+       B-A7 dissolves automatically: button becomes enabled at modal
+       open, click fires the existing handler at line 3390, validation
+       + commitUpload flow proceeds as designed.
+       
+       B-A6 (NOISE) — admin-get-office-discount returns 404 with
+       office_subscription_not_found for offices without Stripe
+       subscriptions (complimentary_partner, fresh offices pre-card-setup).
+       Backend behavior is correct — no subscription means no discount.
+       Dashboard's loadOfficeDiscount (line 5038) cached the result but
+       still console.error'd every 404, and force=true callers (tier
+       change, subscription refresh) bypassed cache. Console flooded.
+       Fix at loadOfficeDiscount: when efRes.status === 404 and
+       efRes.body.error === 'office_subscription_not_found', treat as
+       {discount: null} silently — no console.error, cache still set so
+       subsequent non-force calls skip the fetch, force=true callers
+       still attempt fetch but suppress the log on this specific error.
+       Other error paths (network, 500, unexpected status) still log.
+       
+       v34 (folded in) — auto-send welcome email after office creation.
+       Replaced mailto: link with edgeFetch to admin-send-setup-link-email
+       Edge Function (master verified end-to-end before this swap).
+       Two-toast pattern: "Birou creat. Trimit emailul de bun venit..."
+       (immediate) → "Email trimis către <email>" (within ~5s) on success,
+       error toast on failure. complimentary_partner branch unchanged
+       (skips email, toast: "Birou creat. Cont Partner — fără abonament
+       Stripe."). resendSetupLink button unchanged. EDGE_FN map (line
+       1744) gained sendSetupLinkEmail entry pointing at
+       /functions/v1/admin-send-setup-link-email.
+       
+       Not changed: commitUpload() (still v31 schema-aligned), CUI
+       validator (still v31 shape-only), tab-focus refresh, tier change
+       flow, ŞABLOANE column-alias pattern (v33), SUBTYPES retirement
+       (v32). Token validator allowed-set NOT touched (separate ticket
+       per master v24 not-in-scope note).
   v33: TWO column-name drift fixes (master chat patch request 2026-05-07,
        B-A2 + B-A4). Both surfaced from v22's ŞABLOANE retest of v32 —
        browser console showed two HTTP 400s on Supabase queries against
@@ -1716,7 +1785,8 @@ var EDGE_FN = {
   createOfficeSubscription: SUPA_URL + '/functions/v1/admin-create-office-subscription',
   changeOfficeTier:         SUPA_URL + '/functions/v1/admin-change-office-tier',         // round 2
   resendSetupLink:          SUPA_URL + '/functions/v1/admin-resend-setup-link',          // round 2
-  getOfficeDiscount:        SUPA_URL + '/functions/v1/admin-get-office-discount'         // round 2
+  getOfficeDiscount:        SUPA_URL + '/functions/v1/admin-get-office-discount',        // round 2
+  sendSetupLinkEmail:       SUPA_URL + '/functions/v1/admin-send-setup-link-email'       // v34 (folded into v35)
 };
 
 // v28 / Phase 1.2: thin wrapper for Edge Function POSTs. Returns {ok, status, body}.
@@ -2999,6 +3069,20 @@ function openTokenizeFromRaw(rid){
   document.getElementById('upload-modal-title').textContent='Finalizează: '+r.filename;
   resetUploadForm(r.act_type,r.subtype);
   showReplaceNote(r.act_type,r.subtype);
+  // v35 (B-A5 fix): auto-bind the File object from the raw intake row into
+  // selectedFile + dropzone visual. Without this, the user had to re-drop
+  // the same file into the modal dropzone — which kept the upload-submit
+  // button disabled (gate at checkUploadReady requires selectedFile != null).
+  // That's the "double-upload" symptom from master v24's gate-4 repro, which
+  // also presented as B-A7 (button does nothing on click — actually disabled).
+  // Edge case: if r.fileObj is missing (rows added in earlier session before
+  // this fix shipped, or any legacy state), fall back gracefully — empty
+  // dropzone, user can re-drop, no crash.
+  if(r.fileObj){
+    selectedFile=r.fileObj;
+    document.getElementById('file-drop-name').textContent=r.fileObj.name+' ('+Math.round((r.fileObj.size||0)/1024)+' KB)';
+    checkUploadReady();
+  }
   soundSwitch();
   document.getElementById('upload-overlay').classList.add('open');
   document.getElementById('upload-modal').classList.add('open');
@@ -3054,7 +3138,14 @@ function addRawIntakeFiles(files){
       subtype:'',
       status:'pending',
       linked_template_id:null,
-      notes:null
+      notes:null,
+      // v35 (B-A5 fix): retain the File object on the row so
+      // openTokenizeFromRaw() can auto-bind it into the upload modal's
+      // selectedFile + dropzone visual. Client-only field — RAW_INTAKE
+      // is currently a UI-mock per v28+ and not persisted; if/when
+      // master wires office_raw_intake, this field stays client-side
+      // and must NOT be included in the DB insert payload.
+      fileObj:f
     });
     added++;
   });
@@ -4922,24 +5013,22 @@ function submitOfficeCreation(){
     _coSubmitting=false;
     validateOfficeForm();
     soundFinalizat();
-    // v28 / Phase 1.2: setup-link delivery is dashboard-owned (per master chat reply).
-    // Resend pipeline (Resend.com) ships in master chat v15+ as admin-send-setup-link-
-    // email Edge Function. INTERIM: use mailto: so admin opens their own client with
-    // the link pre-filled. Same surface in round 2 — only the click handler swaps from
-    // mailto: to fetch().
+    // v34: setup-link delivery now via edgeFetch to admin-send-setup-link-email.
+    // Master verified the Edge Function end-to-end before this swap. Two-toast
+    // pattern: optimistic "Trimit emailul..." immediate, success/failure toast
+    // when the fire-and-forget call returns. complimentary_partner branch
+    // unchanged (no Stripe subscription, no setup link).
     if(res.setup_url&&payload.plan!=='complimentary_partner'){
-      // Compose a mailto: with setup_url pre-filled. Subject + body in Romanian.
-      var subj=encodeURIComponent('Acte.legal — Configurează cardul biroului');
-      var body=encodeURIComponent(
-        'Bună ziua,\n\nPentru a finaliza configurarea contului acte.legal pentru '+payload.name+
-        ', vă rugăm să introduceți datele cardului folosind link-ul securizat de mai jos:\n\n'+
-        res.setup_url+'\n\n'+
-        'Link-ul este unic — la prima accesare se deschide o pagină Stripe pentru introducerea cardului.\n\nMulțumim,\nEchipa acte.legal'
-      );
-      var mailtoHref='mailto:'+encodeURIComponent(payload.contact_email)+'?subject='+subj+'&body='+body;
-      // Open mailto: in same window — admin's mail client takes over.
-      try{window.location.href=mailtoHref;}catch(e){}
-      showToast('Birou creat. Deschid client-ul de email cu link-ul pre-completat.');
+      showToast('Birou creat. Trimit emailul de bun venit...');
+      edgeFetch(EDGE_FN.sendSetupLinkEmail,{office_id:row.id}).then(function(efRes){
+        if(efRes.ok){
+          showToast('Email trimis către '+payload.contact_email+'.');
+        } else {
+          var err=(efRes.body&&efRes.body.error)||'unknown';
+          console.error('[sendSetupLinkEmail] failed',err,efRes.status);
+          showToast('Birou creat, dar emailul nu a putut fi trimis ('+err+'). Folosește "Trimite link card" din panoul biroului.');
+        }
+      });
     } else if(payload.plan==='complimentary_partner'){
       showToast('Birou creat. Cont Partner — fără abonament Stripe.');
     } else {
@@ -5049,9 +5138,18 @@ function loadOfficeDiscount(officeId,force,cb){
   edgeFetch(EDGE_FN.getOfficeDiscount,{office_id:officeId}).then(function(efRes){
     o.discount_loading=false;
     if(!efRes.ok){
-      // Don't toast — discount fetch failure is silent. Just leave 'Nicio
-      // reducere' showing. Log for diagnostics.
-      console.error('[loadOfficeDiscount] failed',(efRes.body&&efRes.body.error)||'unknown',efRes.status);
+      var errCode=(efRes.body&&efRes.body.error)||'unknown';
+      // v35 (B-A6 fix): office_subscription_not_found is a valid backend
+      // response — offices without Stripe subscriptions (complimentary_partner,
+      // fresh offices pre-card-setup) legitimately have no discount data.
+      // Treat as {discount: null} silently. No console.error. Cache so
+      // non-force callers skip; force=true callers (tier change, subscription
+      // refresh) still re-fetch but stay silent on this specific code.
+      // Other error paths (network, 500, unexpected status) still log for
+      // diagnostics — those are real failures.
+      if(efRes.status!==404||errCode!=='office_subscription_not_found'){
+        console.error('[loadOfficeDiscount] failed',errCode,efRes.status);
+      }
       o.discount=null;
       _DISCOUNT_CACHE[officeId]=null;
       if(cb)cb();
