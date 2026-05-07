@@ -1,7 +1,42 @@
 <!DOCTYPE html>
 <!--
-  acte.legal — Admin Dashboard v35
+  acte.legal — Admin Dashboard v36
   Visual system: identical to notariat_dashboard_v48.html
+  v36: ONE bug fix (master chat v25 patch request 2026-05-08, B-A8).
+       FIELD_SUFFIXES token registry was stale — only 7 universal field
+       suffixes (NAME, CNP, ID_SERIES, BIRTH_DATE, ADDRESS, PHONE, EMAIL).
+       Canonical Batch 5.5 schema defines 13 universal fields per role
+       plus the FULL_NAME alias. Result: every real notary template (all
+       authored against Batch 5.5 schema) failed admin upload validation
+       with 8+ "unknown token" errors — v35 retest blocked at gate 4.
+       Surfaced when master v25 retested upload-from-raw flow with
+       template_legalizare_semnatura_v1.docx — 8 universal SEMNATAR_*
+       tokens flagged as unknown, all of which exist in case_parties
+       (FULL_NAME, ID_NUMBER, ID_ISSUER, ID_ISSUE_DATE, BIRTH_PLACE,
+       CITIZENSHIP, MARITAL_STATUS) plus DOCUMENT_TYPE which is a
+       subtype-aware "extras" token and stays out-of-scope here.
+       Fix: replace FIELD_SUFFIXES (line 1915) with the canonical
+       14-entry array (13 universal fields + NAME legacy alias). No
+       changes to validTokensFor(), roleToPrefix(), CASE_TOKENS, or
+       ROLES_BY_ACT — they iterate FIELD_SUFFIXES and just need the
+       updated registry. After fix:
+         • validTokensFor('legalizari') → 17 tokens (14 SEMNATAR_* + 3 case)
+         • validTokensFor('procuri') → 31 tokens (14 MANDANT_* + 14 MANDATAR_* + 3 case)
+         • validTokensFor('declaratii') → 17 tokens (14 DECLARANT_* + 3 case)
+         • validTokensFor('acorduri') → 31 tokens (14 PARTE_I_* + 14 PARTE_II_* + 3 case)
+       Backward compat: the legacy `_NAME` suffix is preserved alongside
+       the canonical `_FULL_NAME` so any pre-Batch-5.5 templates still
+       validate.
+       Out of scope (B-A9, follow-up):
+         • Subtype-aware "extras" tokens (e.g. SEMNATAR_DOCUMENT_TYPE for
+           legalizari/semnatura, MANDANT_PROFESSION for procuri/vanzare-
+           imobil). These need a schema-aware lookup of which subtype is
+           being uploaded and what extras it defines — meaningfully
+           bigger surface area than the universal-13 fix.
+       Not changed: B-A5/B-A6/B-A7 fixes (v35), v34 mailto→fetch,
+       commitUpload(), CUI validator, tab-focus refresh, tier change
+       flow, ŞABLOANE column-alias pattern (v33), SUBTYPES retirement
+       (v32). All carried forward intact.
   v35: THREE bug fixes (master chat v24 patch request 2026-05-07,
        B-A5 + B-A6 + B-A7). v35 is also a CONSOLIDATED ship that folds
        in v34 changes (mailto→fetch swap) — v34.html was shipped to
@@ -1912,7 +1947,33 @@ function coverageFor(oid){
   return {covered:covered,target:COVERAGE_TARGET,total:tpls.length};
 }
 var ROLES_BY_ACT = {procuri:['Mandant','Mandatar'],declaratii:['Declarant'],acorduri:['Parte I','Parte II'],legalizari:['Semnatar']};
-var FIELD_SUFFIXES = ['NAME','CNP','ID_SERIES','BIRTH_DATE','ADDRESS','PHONE','EMAIL'];
+// v36 (B-A8 fix): canonical Batch 5.5 universal-token registry. The prior
+// array (NAME/CNP/ID_SERIES/BIRTH_DATE/ADDRESS/PHONE/EMAIL — 7 entries) was
+// stale; canonical schema defines 13 universal fields per role plus the
+// FULL_NAME alias of NAME. Notary v55 FIELD_REGISTRY ships 11 of these (no
+// PHONE/EMAIL — those are case-level booker info, not per-party). Admin
+// validator must accept all 13 + the NAME alias = 14 entries below.
+// See batch_5_5_token_map_update.md for the schema → token mapping.
+// NOTE: this covers UNIVERSAL fields only. Subtype-aware "extras" tokens
+// (e.g. SEMNATAR_DOCUMENT_TYPE for legalizari/semnatura) are tracked
+// separately as B-A9 and will still surface as unknown in v36 — accepted
+// scope per master v25.
+var FIELD_SUFFIXES = [
+  'NAME',           // legacy alias — kept for backward compat with pre-Batch-5.5 templates
+  'FULL_NAME',      // canonical (Batch 5.5) — case_parties.full_name
+  'CNP',            // case_parties.cnp
+  'ID_SERIES',      // case_parties.id_series
+  'ID_NUMBER',      // case_parties.id_number (Batch 5.5)
+  'ID_ISSUER',      // case_parties.id_issuer (Batch 5.5)
+  'ID_ISSUE_DATE',  // case_parties.id_issue_date (Batch 5.5)
+  'BIRTH_DATE',     // case_parties.birth_date
+  'BIRTH_PLACE',    // case_parties.birth_place (Batch 5.5)
+  'ADDRESS',        // case_parties.address
+  'CITIZENSHIP',    // case_parties.citizenship (Batch 5.5)
+  'MARITAL_STATUS', // case_parties.marital_status (Batch 5.5)
+  'PHONE',          // cases.client_phone (primary contact role only)
+  'EMAIL'           // cases.client_email (primary contact role only)
+];
 var CASE_TOKENS = ['CASE_REF','ACT_TYPE','APPOINTMENT_DATE'];
 
 function roleToPrefix(r){return r.normalize('NFD').replace(/[\u0300-\u036f]/g,'').toUpperCase().replace(/\s+/g,'_').replace(/[^A-Z0-9_]/g,'');}
