@@ -1,7 +1,62 @@
 <!DOCTYPE html>
 <!--
-  acte.legal — Admin Dashboard v37
+  acte.legal — Admin Dashboard v38
   Visual system: identical to notariat_dashboard_v48.html
+  v38: TWO fixes (master chat v27 patch request 2026-05-08).
+
+       B-A10 (HIGH BLOCKER) — commitUpload supersede ordering. Surfaced
+       on master v27's gate-4 retest with Cabinet Notarial Andreea
+       Frumoasa: prior active legalizari/legalizare-semnatura row
+       existed; replacement upload validated cleanly (B-A9 paid off)
+       but commit failed with "duplicate key value violates unique
+       constraint ux_office_templates_active". The DB has a partial
+       unique index on (office_id, act_type, subtype_id) WHERE
+       status='active'; v37 inserted the new active row BEFORE
+       superseding the prior, which the index rejects. Latent since
+       v31's commitUpload rewrite — never surfaced because prior
+       retests used clean offices with no priors per subtype.
+       Fix: reorder commitUpload's DB_LIVE branch to supersede-first,
+       insert-second, with rollback-on-insert-failure to avoid
+       leaving the office with zero active templates. Sequence:
+         (1) Storage upload (unchanged)
+         (2) Find priors from local TEMPLATES cache
+         (3) Supersede priors FIRST (status='superseded',
+             superseded_by=NULL placeholder); abort on failure
+         (4) Insert new row (status='active') — index now permits it
+             (4a) On insert failure: rollback prior to status='active'
+                  and abort with toast; storage orphan acceptable
+                  (recoverable; broken DB is not — same lock as v31)
+         (5) Patch superseded_by=newId on priors (best-effort,
+             non-blocking; metadata loss is acceptable degradation)
+         (6) Delete prior storage objects (unchanged)
+         (7) Update local TEMPLATES cache + finishUpload (unchanged)
+       Concurrency: brief window where zero active rows exist if
+       step 4 fails; acceptable because uploads are rare and rollback
+       restores state. Transactional RPC version logged as N050 for
+       future scope if concurrency becomes real. Mock branch
+       (line ~3826 post-patch) untouched.
+
+       N049 (cosmetic) — Suppress "Conectat la Supabase · Date live"
+       healthy-state banner. UI noise; failures already surface via
+       toasts and the existing mock-fallback banner. Single-line
+       change at v37 line 2228: replace setDbBanner(true, ...) with
+       direct DB_LIVE=true assignment — preserves the load-bearing
+       side effect that gates commitUpload/loadAll routing without
+       rendering the banner. The setDbBanner function and the
+       mock-fallback call (line 2223) are untouched — useful
+       diagnostic when Supabase is genuinely down.
+
+       Not changed: B-A9 extras token validation (v37, untouched —
+       commit path is separate from validate path), FIELD_SUFFIXES
+       (v36 lock), all v35/v34/v33/v32/v31/v29/v28 carry-forwards.
+       Out of scope:
+         • B-A6 cosmetic 404 cleanup (waiting on N045 Edge Function
+           backfill — separate patch when admin-get-office-discount.ts
+           lands in library)
+         • N022 admin onboarding guide
+         • N034 label decomposition
+         • N050 transactional commitUpload RPC (future, if concurrency
+           ever becomes real)
   v37: ONE bug fix (master chat v26 patch request 2026-05-08, B-A9 = N041).
        v36's FIELD_SUFFIXES expansion fixed universal-per-role tokens but
        did not address subtype-aware "extras" tokens — fields that belong
@@ -2225,7 +2280,9 @@ function loadAll(){
       CASES=SEED_CASES;
       TEMPLATES=SEED_TEMPLATES;
     } else {
-      setDbBanner(true,'Conectat la Supabase · Date live');
+      // N049 (master v27): healthy state is implicit — failures surface via toasts.
+      // Banner reserved for mock/fallback diagnostic only (see setDbBanner(false, ...) call above).
+      DB_LIVE=true;
       OFFICES=offRes.data.map(function(o){
         // v29: derive display "status" from lifecycle_status. 'active' → 'activ',
         // 'suspended' → 'avertisment', 'archived' → 'archived' (filtered elsewhere).
@@ -3717,78 +3774,109 @@ function commitUpload(actType,subtype,name,notes,tokens,done){
   var sizeBytes=fileObj.size||0;
 
   if(DB_LIVE){
-    // 1. Upload to office-assets (upsert true so re-uploading the SAME filename
-    //    in the same subtype folder overwrites cleanly. Replacements with a
-    //    DIFFERENT filename create a new path and the supersede step deletes
-    //    the prior path.)
+    // B-A10 (master v27 patch) — supersede-first ordering to satisfy ux_office_templates_active
+    // partial unique index. Prior comment block (Q1-Q4) about bucket / supersede / schema / FK
+    // still applies; only the ordering of DB writes changes here.
+    //
+    // Sequence:
+    //   1. Storage upload (unchanged)
+    //   2. Find prior active row(s) for (office, act_type, subtype_id)
+    //   3. If prior exists: supersede FIRST (status='superseded', superseded_by=NULL placeholder)
+    //   4. Insert new row (status='active') — now the unique index permits it
+    //      4a. On insert failure: rollback prior to active and abort
+    //   5. Patch superseded_by linkage on prior (best-effort, non-blocking on failure)
+    //   6. Delete prior storage objects (unchanged)
+    //   7. Update local TEMPLATES cache + finishUpload (unchanged)
     sb.storage.from('office-assets').upload(storagePath,fileObj,{upsert:true,contentType:mimeType}).then(function(res){
       if(res.error){
         soundErr();showToast('Eroare stocare: '+res.error.message);if(done)done();return;
       }
-      // 2. Insert new office_templates row (status='active'). Insert FIRST so
-      //    we have the new row's id for superseded_by linkage, then update
-      //    prior actives.
-      sb.from('office_templates').insert({
-        office_id:oid,
-        act_type:actType,
-        subtype_id:sub.id,
-        filename:filename,
-        storage_path:storagePath,
-        mime_type:mimeType,
-        size_bytes:sizeBytes,
-        status:'active',
-        uploaded_by:CURRENT_USER?CURRENT_USER.id:null
-      }).select().single().then(function(ins){
-        if(ins.error){
-          soundErr();showToast('Eroare înregistrare: '+ins.error.message);
+      // Step 2: find priors from local cache
+      var priors=TEMPLATES.filter(function(t){
+        return t.office_id===oid && t.act_type===actType
+            && t.subtype_id===sub.id && t.status==='active';
+      });
+      // Step 3: supersede priors FIRST (if any)
+      var supersedeChain=priors.length
+        ?sb.from('office_templates').update({status:'superseded',superseded_by:null})
+            .in('id',priors.map(function(t){return t.id;}))
+        :Promise.resolve({error:null});
+      supersedeChain.then(function(supRes){
+        if(supRes&&supRes.error){
+          soundErr();showToast('Eroare la marcarea șablonului anterior: '+supRes.error.message);
           if(done)done();return;
         }
-        var newId=ins.data.id;
-        // 3. Find prior active rows for the same (office_id, act_type, subtype_id)
-        //    triple. Defensively expects 0 or 1 row (unique partial index on
-        //    status='active' should prevent multiples), but supersedes ALL.
-        var priors=TEMPLATES.filter(function(t){
-          return t.office_id===oid && t.act_type===actType
-              && t.subtype_id===sub.id && t.status==='active' && t.id!==newId;
-        });
-        // 4. Update prior rows: status='superseded', superseded_by=newId.
-        var updateChain=priors.length
-          ?sb.from('office_templates').update({status:'superseded',superseded_by:newId})
-              .in('id',priors.map(function(t){return t.id;}))
-          :Promise.resolve({error:null});
-        updateChain.then(function(updRes){
-          if(updRes&&updRes.error){
-            // Don't roll back — log + continue. Worst case: dashboard shows two
-            // active rows briefly until next loadAll cleans up.
-            console.warn('[commitUpload] supersede update failed',updRes.error);
-          }
-          // 5. Delete prior storage objects. Master lock: log warning on failure,
-          //    don't roll back — orphan is recoverable, broken DB is not. Skip
-          //    paths that match the new path (same filename → already overwritten).
-          var stalePaths=priors.map(function(t){return t.storage_path;})
-            .filter(function(p){return p && p!==storagePath;});
-          var deleteChain=stalePaths.length
-            ?sb.storage.from('office-assets').remove(stalePaths)
-            :Promise.resolve({error:null});
-          deleteChain.then(function(delRes){
-            if(delRes&&delRes.error){
-              console.warn('[commitUpload] orphan storage delete failed',delRes.error);
+        // Optimistic local cache update — flip priors to superseded.
+        // We'll roll this back if step 4 fails.
+        priors.forEach(function(t){t.status='superseded';});
+        // Step 4: insert new row (status='active')
+        sb.from('office_templates').insert({
+          office_id:oid,
+          act_type:actType,
+          subtype_id:sub.id,
+          filename:filename,
+          storage_path:storagePath,
+          mime_type:mimeType,
+          size_bytes:sizeBytes,
+          status:'active',
+          uploaded_by:CURRENT_USER?CURRENT_USER.id:null
+        }).select().single().then(function(ins){
+          if(ins.error){
+            // Step 4a: rollback supersede
+            soundErr();
+            console.warn('[commitUpload B-A10] insert failed, rolling back supersede',ins.error);
+            if(priors.length){
+              sb.from('office_templates').update({status:'active'})
+                .in('id',priors.map(function(t){return t.id;}))
+                .then(function(rbRes){
+                  if(rbRes&&rbRes.error){
+                    console.warn('[commitUpload B-A10] rollback failed — manual cleanup may be needed',rbRes.error);
+                  } else {
+                    // Restore local cache
+                    priors.forEach(function(t){t.status='active';});
+                  }
+                });
             }
-            soundFinalizat();
-            // Update local TEMPLATES cache: mark priors superseded, push new row.
-            priors.forEach(function(t){t.status='superseded';t.superseded_by=newId;});
-            var displayName=(ACT_LABELS_SINGULAR[actType]||actType)+' — '+sub.label;
-            TEMPLATES.push({
-              id:newId, office_id:oid, act_type:actType,
-              subtype:sub.label, subtype_id:sub.id, subtype_key:sub.subtype_key,
-              name:displayName, filename:filename,
-              storage_path:storagePath, mime_type:mimeType, size_bytes:sizeBytes,
-              placeholders:tokens||[],   // local UI only — not persisted
-              status:'active', superseded_by:null,
-              uploaded_at:'azi', notes:''
+            showToast('Eroare înregistrare: '+ins.error.message);
+            if(done)done();return;
+          }
+          var newId=ins.data.id;
+          // Step 5: patch superseded_by linkage on priors (best-effort)
+          var linkageChain=priors.length
+            ?sb.from('office_templates').update({superseded_by:newId})
+                .in('id',priors.map(function(t){return t.id;}))
+            :Promise.resolve({error:null});
+          linkageChain.then(function(linkRes){
+            if(linkRes&&linkRes.error){
+              console.warn('[commitUpload B-A10] superseded_by linkage update failed',linkRes.error);
+            }
+            // Update local cache linkage
+            priors.forEach(function(t){t.superseded_by=newId;});
+            // Step 6: delete prior storage objects (skip same-path)
+            var stalePaths=priors.map(function(t){return t.storage_path;})
+              .filter(function(p){return p && p!==storagePath;});
+            var deleteChain=stalePaths.length
+              ?sb.storage.from('office-assets').remove(stalePaths)
+              :Promise.resolve({error:null});
+            deleteChain.then(function(delRes){
+              if(delRes&&delRes.error){
+                console.warn('[commitUpload B-A10] orphan storage delete failed',delRes.error);
+              }
+              soundFinalizat();
+              // Step 7: update local TEMPLATES cache + push new row
+              var displayName=(ACT_LABELS_SINGULAR[actType]||actType)+' — '+sub.label;
+              TEMPLATES.push({
+                id:newId, office_id:oid, act_type:actType,
+                subtype:sub.label, subtype_id:sub.id, subtype_key:sub.subtype_key,
+                name:displayName, filename:filename,
+                storage_path:storagePath, mime_type:mimeType, size_bytes:sizeBytes,
+                placeholders:tokens||[],   // local UI only — not persisted
+                status:'active', superseded_by:null,
+                uploaded_at:'azi', notes:''
+              });
+              finishUpload(displayName,newId);
+              if(done)done();
             });
-            finishUpload(displayName,newId);
-            if(done)done();
           });
         });
       });
