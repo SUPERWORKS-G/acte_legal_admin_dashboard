@@ -1,7 +1,21 @@
 <!DOCTYPE html>
 <!--
-  acte.legal — Admin Dashboard v44.4
+  acte.legal — Admin Dashboard v44.5
   Visual system: identical to notariat_dashboard_v48.html
+  v44.5: Post-patch-3 hot-fix. v44.4 smoke surfaced create-notary-office
+       returning HTTP 500 with `error: "generate_link_failed"` when the
+       contact_email already exists in auth.users. Frontend was treating
+       all 5xx as generic ("Eroare. Încearcă din nou.") — admin had no
+       way to know the email was the problem. Now mapped:
+         generate_link_failed + detail "already registered" →
+           "Acest email este deja folosit. Încearcă alt email."
+         generate_link_failed (other detail) →
+           "Nu am putut genera link-ul de activare." + console.error
+       Note: technically EF should return 4xx for the duplicate-email case
+       (it's user-fixable) and rollback the partial office insert. Flagged
+       to master as N076 (see admin_to_master_v44_5_generate_link_failed.md).
+       This patch is a frontend defense; master fixes the EF separately.
+
   v44.4: Patch 3 — final piece of Round 2.
        (A) New "Retrimite link de activare" button in office detail modal
            (Detalii → Abonament sub-tab, right below the existing "Link card"
@@ -5778,8 +5792,23 @@ function createOfficeSubscription(payload,cb){
           }
         } else {
           // 5xx — generic toast; full body in console for master debugging.
-          console.error('[create-notary-office] '+status+' error',code,b);
-          msg='Eroare. Încearcă din nou.';
+          // EXCEPTION: generate_link_failed is technically returned as 500 by
+          // the EF today, but the real cause is almost always a duplicate
+          // email (already in auth.users). Surface as user-actionable.
+          // Master flagged: re-classify to 4xx + add rollback (admin note
+          // v44.5 to master).
+          if(code==='generate_link_failed'){
+            // Inspect `detail` to distinguish duplicate-email from other auth errors.
+            if(b.detail&&/already.*registered/i.test(b.detail)){
+              msg='Acest email este deja folosit. Încearcă alt email.';
+            } else {
+              msg='Nu am putut genera link-ul de activare. Încearcă din nou.';
+              console.error('[create-notary-office] '+status+' error',code,b);
+            }
+          } else {
+            console.error('[create-notary-office] '+status+' error',code,b);
+            msg='Eroare. Încearcă din nou.';
+          }
         }
         cb({ok:false,message:msg,code:code});
       });
