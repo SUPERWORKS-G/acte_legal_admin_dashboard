@@ -1,7 +1,44 @@
 <!DOCTYPE html>
 <!--
-  acte.legal — Admin Dashboard v44
+  acte.legal — Admin Dashboard v44.2
   Visual system: identical to notariat_dashboard_v48.html
+  v44.2: Patch 2 — Suspend / Dezactivează / Reactivează rewired to lifecycle
+       EFs via sb.functions.invoke():
+         suspended → suspend-notary-office   (no email — pause/temporary)
+         archived  → deactivate-notary-office (sends notary_office_deactivated)
+         active    → reactivate-notary-office (sends notary_office_reactivated)
+       Old `if(DB_LIVE){showToast('Acțiunea așteaptă backend-ul');return;}`
+       stub removed. Seed-mode (no SUPA_KEY) path preserved for offline UI.
+       Local state (o.lifecycle_status) updated from EF response on success
+       (authoritative). renderLifePane + renderA re-fired post-success.
+       4xx Romanian toasts mapped:
+         office_not_found    → "Biroul nu a fost găsit."
+         already_archived    → "Biroul este deja arhivat."
+         already_active      → "Biroul este deja activ."
+         not_in_active_state → "Biroul nu este în stare activă."
+       5xx → generic "Eroare. Încearcă din nou." + console.error with detail.
+       reactivate-notary-office's optional `stripe_note` (subscription period
+       expired) surfaced as secondary toast 1.5s after success toast.
+       Motiv field still validated (required) but NOT sent to backend —
+       master tracks audit persistence as N074 (post-Round-2). TODO comment
+       in code for one-line wiring when N074 ships.
+       Patch 3 (next): new "Retrimite link" button + "Neactivat" visual cue
+       + add setup_completed_at to office-row SELECT.
+
+  v44.1: Diagnostic-only patch (debug iteration). Error handler reads the
+       raw response body manually from FunctionsHttpError.context so 5xx
+       error codes surface in console (supabase-js does NOT auto-parse
+       non-2xx bodies — without this, console object was empty).
+       v44 patch 1 first smoke surfaced a 500 from create-notary-office
+       with `unknown_error`; v44.1's diagnostic patch was the next step.
+       George re-tried after master cleaned up 3 orphan office rows
+       (Hai Gica, Haide bre, Test X — half-committed by failed EF runs);
+       create flow then succeeded on a different test email. Root cause
+       of the original 500 not yet pinned — possible candidates: EF cold
+       start, transient backend issue, or partial-commit on auth link gen.
+       Full create-office investigation deferred to post-patch-3 per
+       George's direction.
+
   v44: Round 2 of B2B email/lifecycle wiring (master v44 N072 EFs ready,
        admin v43 closed idle by design, admin v44 picks up). Five EFs
        wired via sb.functions.invoke():
@@ -4574,6 +4611,29 @@ function lifePick(s,btn){
     b.classList.toggle('sel-active',b.dataset.life===s);
   });
 }
+// v44 / Round 2 (N072): lifeCommit routes through 3 lifecycle EFs via
+// supabase.functions.invoke(). Mapping:
+//   suspended → suspend-notary-office   (no email — pause/temporary)
+//   archived  → deactivate-notary-office (sends notary_office_deactivated email)
+//   active    → reactivate-notary-office (sends notary_office_reactivated email)
+//
+// Reason field: validated locally (admin must type a reason) but NOT sent
+// to backend today. Master tracks audit persistence as N074 (post-Round-2
+// debt). When N074 ships, send `reason: motivValue` in body — one-line
+// change here.
+//
+// Stripe handling: each lifecycle EF handles stripe_subscription_id IS NULL
+// gracefully (skips Stripe, flips DB only). Used for trial / complimentary
+// offices and for offices where notary hasn't configured billing yet.
+//
+// Error toast mapping (per master spec):
+//   4xx → user-actionable Romanian (404 office_not_found, 409 state-conflict,
+//         etc.)
+//   5xx → generic "Eroare. Încearcă din nou." + console.error with detail.
+//
+// reactivate-notary-office may return `stripe_note` as a string when the
+// subscription period had expired (notary needs a new sub). Surfaced as a
+// secondary toast so admin knows to follow up.
 function lifeCommit(){
   var o=OM[currentOfficeId];if(!o){soundErr();return;}
   var cur=lifeCurrent(o);
@@ -4588,16 +4648,91 @@ function lifeCommit(){
     if(errEl){errEl.textContent='Motivul este obligatoriu';errEl.classList.add('show');}
     soundErr();return;
   }
-  // TODO: when office_lifecycle_log + RPCs ship (amendment B), route through Supabase.
-  if(window.DB_LIVE){showToast('Acțiunea așteaptă backend-ul');return;}
-  o.lifecycle_status=lifePicked==='active'?null:lifePicked;
-  soundFinalizat();
-  var action=lifePicked==='suspended'?'Suspendat'
+  // TODO (N074): send reason in body once master ships audit persistence.
+
+  // Seed mode (no SUPA_KEY) — preserve previous in-memory behavior.
+  if(!SUPA_KEY){
+    o.lifecycle_status=lifePicked;
+    soundFinalizat();
+    var labelSeed=lifePicked==='suspended'?'Suspendat'
+      :(lifePicked==='archived'?'Dezactivat':'Reactivat');
+    showToast(labelSeed+': '+o.name);
+    renderLifePane();renderA();
+    if(typeof closeOffice==='function')closeOffice();
+    return;
+  }
+
+  // EF dispatch — map lifePicked to the right EF name.
+  var efName=lifePicked==='suspended'?'suspend-notary-office'
+    :(lifePicked==='archived'?'deactivate-notary-office':'reactivate-notary-office');
+  var actionLabel=lifePicked==='suspended'?'Suspendat'
     :(lifePicked==='archived'?'Dezactivat':'Reactivat');
-  showToast(action+': '+o.name);
-  renderLifePane();
-  renderA();
-  if(typeof closeOffice==='function')closeOffice();
+
+  // Disable confirm button + show in-flight state on the picker.
+  var confirmBtn=document.getElementById('om-life-confirm-btn');
+  if(confirmBtn){confirmBtn.disabled=true;}
+
+  sb.functions.invoke(efName,{body:{office_id:currentOfficeId}}).then(function(efRes){
+    if(efRes.error){
+      var resp=efRes.error.context;
+      var status=(resp&&resp.status)||0;
+      var bodyPromise=resp&&typeof resp.json==='function'
+        ? resp.clone().json().catch(function(){return resp.clone().text().then(function(t){return {error:'unparseable_body',raw:t};});})
+        : Promise.resolve({});
+      bodyPromise.then(function(b){
+        b=b||{};
+        var code=b.error||'unknown_error';
+        var msg;
+        if(status>=400&&status<500){
+          // 4xx — Romanian user-actionable.
+          if(code==='office_not_found'){
+            msg='Biroul nu a fost găsit.';
+          } else if(code==='already_archived'){
+            msg='Biroul este deja arhivat.';
+          } else if(code==='already_active'){
+            msg='Biroul este deja activ.';
+          } else if(code==='not_in_active_state'){
+            msg='Biroul nu este în stare activă.';
+          } else {
+            msg='Acțiune respinsă (cod: '+code+').';
+          }
+        } else {
+          // 5xx — generic toast; full body in console.
+          console.error('['+efName+'] '+status+' error',code,b);
+          msg='Eroare. Încearcă din nou.';
+        }
+        if(errEl){errEl.textContent=msg;errEl.classList.add('show');}
+        soundErr();
+        if(confirmBtn){confirmBtn.disabled=false;}
+      });
+      return;
+    }
+    var b=efRes.data||{};
+    if(!b.ok){
+      console.error('['+efName+'] 2xx but ok:false',b);
+      if(errEl){errEl.textContent='Răspuns neașteptat. Vezi consola.';errEl.classList.add('show');}
+      soundErr();
+      if(confirmBtn){confirmBtn.disabled=false;}
+      return;
+    }
+    // Success — update local state from EF response (authoritative).
+    o.lifecycle_status=b.lifecycle_status||lifePicked;
+    soundFinalizat();
+    showToast(actionLabel+': '+o.name);
+    // reactivate-notary-office may include stripe_note when subscription
+    // period had expired. Surface as a secondary toast so admin knows.
+    if(b.stripe_note){
+      setTimeout(function(){showToast('Notă Stripe: '+b.stripe_note);},1500);
+    }
+    renderLifePane();renderA();
+    if(confirmBtn){confirmBtn.disabled=false;}
+    if(typeof closeOffice==='function')closeOffice();
+  }).catch(function(err){
+    console.error('['+efName+'] invoke threw',err);
+    if(errEl){errEl.textContent='Eroare rețea. Încearcă din nou.';errEl.classList.add('show');}
+    soundErr();
+    if(confirmBtn){confirmBtn.disabled=false;}
+  });
 }
 
 function openOfficeMail(which){
