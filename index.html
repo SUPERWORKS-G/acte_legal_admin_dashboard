@@ -1,7 +1,17 @@
 <!DOCTYPE html>
 <!--
-  acte.legal — Admin Dashboard v44.2
+  acte.legal — Admin Dashboard v44.3
   Visual system: identical to notariat_dashboard_v48.html
+  v44.3: Search-chip dropdown UX fix. Previously the Suspendat/Dezactivat
+       chips (and Anulat/Finalizat chips on the Dosare view) stayed visible
+       until the admin backspaced the trigger text away. Now they hide on:
+         - blur (with 150ms delay so chip clicks register first)
+         - click anywhere outside .search-wrap (document-level handler)
+       No change to show logic — still triggers on any prefix of 'status'
+       or the full word anywhere in the input value. Backspace token-wipe
+       behavior preserved.
+       Applies to both search-a (BIROURI) and search-b (DOSARE) inputs.
+
   v44.2: Patch 2 — Suspend / Dezactivează / Reactivează rewired to lifecycle
        EFs via sb.functions.invoke():
          suspended → suspend-notary-office   (no email — pause/temporary)
@@ -6164,6 +6174,8 @@ var _sb=document.getElementById('search-b');if(_sb)_sb.addEventListener('input',
 
 // Search chips — appear when input contains the word 'status' (typed or pasted).
 // Clicking a chip fills the input with the tag token and re-runs search.
+// v44.3: chips now also hide on blur / click-outside. Previously they stayed
+// visible until the admin backspaced the text away.
 (function wireSearchChips(){
   function syncChipVisibility(inp){
     var wrap=inp?inp.parentNode:null;
@@ -6177,12 +6189,27 @@ var _sb=document.getElementById('search-b');if(_sb)_sb.addEventListener('input',
     var hasWord=/status/.test(v);
     wrap.classList.toggle('show-chips',isPrefix||hasWord);
   }
+  // Hide all chip dropdowns. Used by blur + document-level click-outside.
+  function hideAllChips(){
+    document.querySelectorAll('.search-wrap.show-chips').forEach(function(w){
+      w.classList.remove('show-chips');
+    });
+  }
   ['a','b'].forEach(function(suf){
     var inp=document.getElementById('search-'+suf);
     if(!inp)return;
     inp.addEventListener('input',function(){syncChipVisibility(this);});
     // Also sync on focus in case the input already has text.
     inp.addEventListener('focus',function(){syncChipVisibility(this);});
+    // Blur hides chips, but with a small delay so a chip click can register
+    // first (chip mousedown already preventDefaults focus theft, but blur
+    // fires before click on some browsers — the delay covers that race).
+    inp.addEventListener('blur',function(){
+      var wrap=this.parentNode;
+      setTimeout(function(){
+        if(wrap)wrap.classList.remove('show-chips');
+      },150);
+    });
     // Backspace wipes the whole status token in one hit when cursor is at end.
     // Matches 'status' / 'status:' / 'status: <word>' with optional trailing space.
     inp.addEventListener('keydown',function(e){
@@ -6214,6 +6241,12 @@ var _sb=document.getElementById('search-b');if(_sb)_sb.addEventListener('input',
       inp.dispatchEvent(ev);
       inp.focus();
     });
+  });
+  // Click-outside: any click that's neither on the search-wrap nor inside it
+  // hides all chip dropdowns. Document-level so it catches clicks anywhere.
+  document.addEventListener('click',function(e){
+    if(e.target.closest('.search-wrap'))return; // click was inside a search-wrap, leave it
+    hideAllChips();
   });
 })();
 document.addEventListener('click',function(e){
