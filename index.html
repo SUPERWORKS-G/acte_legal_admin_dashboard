@@ -1,5 +1,14 @@
 <!DOCTYPE html>
 <!--
+  acte.legal — Admin Dashboard v45.1
+  Visual system: identical to notariat_dashboard_v48.html
+  v45.1: One-line follow-up to v45. Master shipped get_admin_all_cases v3
+       which adds `urgent boolean` to the RETURNS TABLE. Admin hydrator now
+       reads `urgent: !!row.urgent` instead of hardcoded `false`. Red urgent
+       badge will now render correctly for cases flagged urgent at intake.
+       (v45 also had RPC v2 in flight which fixed the 42804 enum-vs-text
+       mismatch on `act_type` column 4 — that's master-side, no admin change.)
+
   acte.legal — Admin Dashboard v45
   Visual system: identical to notariat_dashboard_v48.html
   v45: N080 — Wire admin CASES list to live database.
@@ -2828,7 +2837,7 @@ function loadAll(){
             ref: row.ref || '—',
             client: row.client_name || '—',
             status: row.status_ui || 'nou',
-            urgent: false,   // RPC doesn't return urgent flag; default false until master adds it
+            urgent: !!row.urgent,   // v45.1: read from RPC row (master shipped v3 with urgent boolean)
             pref: prefDisplay,
             created: createdDisplay
           };
